@@ -7,7 +7,9 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Media.Animation;
+using SkiaSharp;
+using SkiaSharp.Views.Desktop;
+using SkiaSharp.Views.WPF;
 using WpfMusicPlayer.Helpers;
 using WpfMusicPlayer.ViewModels;
 
@@ -35,16 +37,20 @@ public sealed class LyricsD2DControl : Grid
             typeof(ContextMenu),
             typeof(LyricsD2DControl));
 
-    private static readonly Color LyricNormal = Color.FromArgb(0x88, 0xDD, 0xDD, 0xDD);
-    private static readonly Color LyricHighlight = Colors.White;
-    private static readonly Color SecondaryNormal = Color.FromArgb(0x66, 0xDD, 0xDD, 0xDD);
-    private static readonly Color SecondaryHighlight = Color.FromArgb(0xBB, 0xDD, 0xDD, 0xDD);
-    private static readonly Color HoverFill = Color.FromArgb(0x2A, 0xFF, 0xFF, 0xFF);
+    private static readonly SKColor LyricNormal = new(0xDD, 0xDD, 0xDD, 0x88);
+    private static readonly SKColor LyricHighlight = SKColors.White;
+    private static readonly SKColor SecondaryNormal = new(0xDD, 0xDD, 0xDD, 0x66);
+    private static readonly SKColor SecondaryHighlight = new(0xDD, 0xDD, 0xDD, 0xBB);
+    private static readonly SKColor HoverFill = new(0xFF, 0xFF, 0xFF, 0x2A);
 
-    private readonly Image _image = new()
+    // IgnorePixelScaling = true makes SKElement pre-scale the canvas by the system DPI
+    // so all drawing happens in DIP coordinates (matching the layout math below) while
+    // the backing bitmap stays at full device-pixel resolution. (Verified against the
+    // SkiaSharp.Views.WPF source: with the default false the canvas uses raw device
+    // pixels and no DPI scale is applied.)
+    private readonly SKElement _skElement = new()
     {
-        Stretch = Stretch.Fill,
-        SnapsToDevicePixels = true
+        IgnorePixelScaling = true
     };
 
     private readonly ScrollBar _scrollBar = new()
@@ -57,7 +63,7 @@ public sealed class LyricsD2DControl : Grid
         ViewportSize = 1
     };
 
-    private D2DWpfSurface? _surface;
+    private LyricsSkiaRenderer? _renderer;
     private LyricsViewModel? _viewModel;
     private bool _renderHookActive;
     private bool _dirty = true;
@@ -67,7 +73,7 @@ public sealed class LyricsD2DControl : Grid
     private bool _isDragging;
     private Point _pointerDownPosition;
     private double _offsetAtPointerDown;
-    private int _pendingCenterIndex = -1;
+    private int _pendingAnchorIndex = -1;
     private bool _autoScrollEnabled = true;
     private DateTime _lastUserScrollUtc = DateTime.MinValue;
     private int _hoverIndex = -1;
@@ -80,16 +86,15 @@ public sealed class LyricsD2DControl : Grid
     private float[] _textHeights = [];
     private float[] _translationHeights = [];
     private float[] _romanjiHeights = [];
-    private float[] _displayFontSizes = [];
-    private float[] _displaySecondaryFontSizes = [];
-    private float[] _animFromFont = [];
-    private float[] _animToFont = [];
-    private float[] _animFromSecondary = [];
-    private float[] _animToSecondary = [];
-    private bool[] _animating = [];
-    private long[] _animStartTicks = [];
-    private bool[] _lastHighlighted = [];
     private LyricsLayoutEngine.LyricSizeMetrics[] _focusedMetrics = [];
+    // Per-line extra vertical offsets (DIPs) for the staggered auto-follow scroll.
+    // Each starts at the scroll delta and eases back to zero; rows below the active
+    // line start moving later than rows above, so the list flows from top to bottom.
+    private float[] _lineScrollOffsets = [];
+    private float[] _staggerFromOffsets = [];
+    private int _staggerAnchorIndex;
+    private long _staggerStartTicks;
+    private bool _staggerActive;
     // Per wrapped-line karaoke highlight widths (DIPs) for the currently highlighted line.
     // Recomputed only when the highlighted line's Progress/text/layout changes.
     private float[] _karaokeLineWidths = [];
@@ -103,17 +108,16 @@ public sealed class LyricsD2DControl : Grid
     private bool _cachedShowTranslation;
     private bool _cachedShowRomanji;
     private bool _metricsCacheDirty = true;
-    private bool _surfaceFailed;
 
     public LyricsD2DControl()
     {
         Background = Brushes.Transparent;
         ClipToBounds = true;
         Focusable = true;
-        _image.HorizontalAlignment = HorizontalAlignment.Stretch;
-        _image.VerticalAlignment = VerticalAlignment.Stretch;
-        RenderOptions.SetBitmapScalingMode(_image, BitmapScalingMode.NearestNeighbor);
-        Children.Add(_image);
+        _skElement.HorizontalAlignment = HorizontalAlignment.Stretch;
+        _skElement.VerticalAlignment = VerticalAlignment.Stretch;
+        _skElement.PaintSurface += OnSkElementPaintSurface;
+        Children.Add(_skElement);
         Children.Add(_scrollBar);
 
         _scrollBar.ValueChanged += OnScrollBarValueChanged;
@@ -141,6 +145,10 @@ public sealed class LyricsD2DControl : Grid
         set => SetValue(LineContextMenuProperty, value);
     }
 
+    /// <summary>
+    /// Scrolls the given line to the upper anchor position. The name is kept for
+    /// existing callers; the target is no longer the vertical centre of the viewport.
+    /// </summary>
     public void ScrollLyricToCenter(int index)
     {
         if (!_autoScrollEnabled)
@@ -148,31 +156,29 @@ public sealed class LyricsD2DControl : Grid
             if (!LyricsLayoutEngine.ShouldResumeAutoFollow(
                     true, DateTime.UtcNow - _lastUserScrollUtc))
             {
-                _pendingCenterIndex = index;
+                _pendingAnchorIndex = index;
                 return;
             }
 
             _autoScrollEnabled = true;
         }
 
-        _pendingCenterIndex = index;
+        _pendingAnchorIndex = index;
         EnsureLayout();
         if (_lineHeights.Length == 0 || index < 0 || index >= _lineHeights.Length)
             return;
 
-        var target = LyricsLayoutEngine.ComputeCenterOffset(
+        var target = LyricsLayoutEngine.ComputeAnchorOffset(
             _lineTops[index],
-            _lineHeights[index],
             ActualHeight,
             _contentHeight);
-        AnimateScrollTo(target);
-        _pendingCenterIndex = -1;
+        StartStaggeredScrollTo(target, index);
+        _pendingAnchorIndex = -1;
     }
 
     protected override void OnMouseWheel(MouseWheelEventArgs e)
     {
         SuspendAutoScroll();
-        BeginAnimation(VerticalOffsetProperty, null);
         VerticalOffset = LyricsLayoutEngine.ClampOffset(
             VerticalOffset - e.Delta,
             ActualHeight,
@@ -195,7 +201,6 @@ public sealed class LyricsD2DControl : Grid
 
             if (_isDragging)
             {
-                BeginAnimation(VerticalOffsetProperty, null);
                 VerticalOffset = LyricsLayoutEngine.ClampOffset(
                     _offsetAtPointerDown - dy,
                     ActualHeight,
@@ -279,13 +284,12 @@ public sealed class LyricsD2DControl : Grid
         _metricsCacheDirty = true;
         _layoutDirty = true;
         _dirty = true;
-        ResizeSurface();
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         AttachViewModel(DataContext as LyricsViewModel);
-        CreateSurface();
+        _renderer ??= new LyricsSkiaRenderer();
         StartRendering();
         _layoutDirty = true;
         _dirty = true;
@@ -295,7 +299,8 @@ public sealed class LyricsD2DControl : Grid
     {
         StopRendering();
         DetachViewModel();
-        DisposeSurface();
+        _renderer?.Dispose();
+        _renderer = null;
     }
 
     private void OnSizeChanged(object sender, SizeChangedEventArgs e)
@@ -303,9 +308,8 @@ public sealed class LyricsD2DControl : Grid
         _metricsCacheDirty = true;
         _layoutDirty = true;
         _dirty = true;
-        ResizeSurface();
-        if (_autoScrollEnabled && _pendingCenterIndex >= 0)
-            ScrollLyricToCenter(_pendingCenterIndex);
+        if (_autoScrollEnabled && _pendingAnchorIndex >= 0)
+            ScrollLyricToCenter(_pendingAnchorIndex);
         else
             VerticalOffset = LyricsLayoutEngine.ClampOffset(VerticalOffset, ActualHeight, _contentHeight);
     }
@@ -331,7 +335,7 @@ public sealed class LyricsD2DControl : Grid
         vm.Lyrics.CollectionChanged += OnLyricsCollectionChanged;
         foreach (var line in vm.Lyrics)
             line.PropertyChanged += OnLyricLinePropertyChanged;
-        ResetLineState(animate: false);
+        ResetLineState();
     }
 
     private void DetachViewModel()
@@ -387,7 +391,7 @@ public sealed class LyricsD2DControl : Grid
                 line.PropertyChanged += OnLyricLinePropertyChanged;
         }
 
-        ResetLineState(animate: false);
+        ResetLineState();
         _metricsCacheDirty = true;
         _layoutDirty = true;
         _dirty = true;
@@ -395,25 +399,13 @@ public sealed class LyricsD2DControl : Grid
 
     private void OnLyricLinePropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName == nameof(LyricLineViewModel.Progress))
-        {
-            // Karaoke progress advanced; only the highlighted line repaints.
+        // Karaoke progress or highlight changed; a repaint is enough because all
+        // lines share one font size, so layout metrics never change here.
+        if (e.PropertyName is nameof(LyricLineViewModel.Progress) or nameof(LyricLineViewModel.IsHighlighted))
             _dirty = true;
-            return;
-        }
-
-        if (e.PropertyName != nameof(LyricLineViewModel.IsHighlighted))
-            return;
-        if (sender is not LyricLineViewModel line || _viewModel is null)
-            return;
-
-        var index = _viewModel.Lyrics.IndexOf(line);
-        if (index >= 0)
-            StartFontAnimation(index, line.IsHighlighted);
-        _dirty = true;
     }
 
-    private void ResetLineState(bool animate)
+    private void ResetLineState()
     {
         var count = _viewModel?.Lyrics.Count ?? 0;
         Array.Resize(ref _lineTops, count);
@@ -421,144 +413,10 @@ public sealed class LyricsD2DControl : Grid
         Array.Resize(ref _textHeights, count);
         Array.Resize(ref _translationHeights, count);
         Array.Resize(ref _romanjiHeights, count);
-        Array.Resize(ref _displayFontSizes, count);
-        Array.Resize(ref _displaySecondaryFontSizes, count);
-        Array.Resize(ref _animFromFont, count);
-        Array.Resize(ref _animToFont, count);
-        Array.Resize(ref _animFromSecondary, count);
-        Array.Resize(ref _animToSecondary, count);
-        Array.Resize(ref _animating, count);
-        Array.Resize(ref _animStartTicks, count);
-        Array.Resize(ref _lastHighlighted, count);
         Array.Resize(ref _focusedMetrics, count);
+        Array.Resize(ref _lineScrollOffsets, count);
+        Array.Resize(ref _staggerFromOffsets, count);
         _metricsCacheDirty = true;
-
-        for (var i = 0; i < count; i++)
-        {
-            var highlighted = _viewModel!.Lyrics[i].IsHighlighted;
-            _lastHighlighted[i] = highlighted;
-            _displayFontSizes[i] = highlighted
-                ? LyricsLayoutEngine.HighlightFontSize
-                : LyricsLayoutEngine.NormalFontSize;
-            _displaySecondaryFontSizes[i] = highlighted
-                ? LyricsLayoutEngine.SecondaryHighlightFontSize
-                : LyricsLayoutEngine.SecondaryNormalFontSize;
-            _animating[i] = false;
-            if (animate)
-                StartFontAnimation(i, highlighted);
-        }
-    }
-
-    private void StartFontAnimation(int index, bool highlighted)
-    {
-        if ((uint)index >= (uint)_displayFontSizes.Length)
-            return;
-
-        _animFromFont[index] = _displayFontSizes[index];
-        _animToFont[index] = highlighted
-            ? LyricsLayoutEngine.HighlightFontSize
-            : LyricsLayoutEngine.NormalFontSize;
-        _animFromSecondary[index] = _displaySecondaryFontSizes[index];
-        _animToSecondary[index] = highlighted
-            ? LyricsLayoutEngine.SecondaryHighlightFontSize
-            : LyricsLayoutEngine.SecondaryNormalFontSize;
-        _animStartTicks[index] = DateTime.UtcNow.Ticks;
-        _animating[index] = Math.Abs(_animFromFont[index] - _animToFont[index]) > 0.01f
-                            || Math.Abs(_animFromSecondary[index] - _animToSecondary[index]) > 0.01f;
-        _lastHighlighted[index] = highlighted;
-        _layoutDirty = true;
-        _dirty = true;
-    }
-
-    private bool TickAnimations()
-    {
-        var any = false;
-        var now = DateTime.UtcNow.Ticks;
-        for (var i = 0; i < _animating.Length; i++)
-        {
-            if (!_animating[i])
-                continue;
-
-            var elapsed = (now - _animStartTicks[i]) / (double)TimeSpan.TicksPerSecond;
-            var t = (float)(elapsed / LyricsLayoutEngine.AnimationDurationSeconds);
-            if (t >= 1f)
-            {
-                _displayFontSizes[i] = _animToFont[i];
-                _displaySecondaryFontSizes[i] = _animToSecondary[i];
-                _animating[i] = false;
-            }
-            else
-            {
-                _displayFontSizes[i] = LyricsLayoutEngine.AnimateToward(_animFromFont[i], _animToFont[i], t);
-                _displaySecondaryFontSizes[i] = LyricsLayoutEngine.AnimateToward(
-                    _animFromSecondary[i],
-                    _animToSecondary[i],
-                    t);
-                any = true;
-            }
-
-            _layoutDirty = true;
-            _dirty = true;
-        }
-
-        return any;
-    }
-
-    private void CreateSurface()
-    {
-        if (_surfaceFailed)
-            return;
-
-        DisposeSurface();
-        try
-        {
-            _surface = new D2DWpfSurface();
-            ResizeSurface();
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine(ex);
-            _surfaceFailed = true;
-            DisposeSurface();
-        }
-    }
-
-    private void DisposeSurface()
-    {
-        if (_surface is null)
-            return;
-
-        _image.Source = null;
-        _surface.Dispose();
-        _surface = null;
-    }
-
-    private void ResizeSurface()
-    {
-        if (_surface is null || ActualWidth <= 0 || ActualHeight <= 0)
-            return;
-
-        var dpi = VisualTreeHelper.GetDpi(this);
-        var width = Math.Max(1, (int)Math.Ceiling(ActualWidth * dpi.DpiScaleX));
-        var height = Math.Max(1, (int)Math.Ceiling(ActualHeight * dpi.DpiScaleY));
-        try
-        {
-            if (_surface.EnsureSize(width, height, (float)dpi.PixelsPerInchX, (float)dpi.PixelsPerInchY))
-            {
-                _metricsCacheDirty = true;
-                _layoutDirty = true;
-                _dirty = true;
-            }
-
-            if (!ReferenceEquals(_image.Source, _surface.Bitmap))
-                _image.Source = _surface.Bitmap;
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine(ex);
-            _surfaceFailed = true;
-            DisposeSurface();
-        }
     }
 
     private void StartRendering()
@@ -579,19 +437,16 @@ public sealed class LyricsD2DControl : Grid
 
     private void OnCompositionRendering(object? sender, EventArgs e)
     {
-        if (_surfaceFailed)
-            return;
-
         try
         {
-            var animating = TickAnimations();
             var hoverAnimating = TickHover();
-            if (!_dirty && !animating && !hoverAnimating)
+            var staggerAnimating = TickStagger();
+            if (!_dirty && !hoverAnimating && !staggerAnimating)
                 return;
 
             EnsureLayout();
-            RenderFrame();
-            _dirty = animating || hoverAnimating;
+            _skElement.InvalidateVisual();
+            _dirty = hoverAnimating || staggerAnimating;
         }
         catch (Exception ex)
         {
@@ -608,13 +463,13 @@ public sealed class LyricsD2DControl : Grid
         var vm = _viewModel;
         var count = vm?.Lyrics.Count ?? 0;
         if (count != _lineHeights.Length)
-            ResetLineState(animate: false);
+            ResetLineState();
 
         var width = Math.Max(1f, (float)ActualWidth
             - LyricsLayoutEngine.ContentPaddingLeft
             - LyricsLayoutEngine.ContentPaddingRight);
         _layoutWidth = width;
-        if (vm is null || _surface is null || count == 0)
+        if (vm is null || _renderer is null || count == 0)
         {
             _layoutDirty = false;
             _metricsCacheDirty = count == 0;
@@ -637,21 +492,11 @@ public sealed class LyricsD2DControl : Grid
 
         for (var i = 0; i < count; i++)
         {
-            var mainScale = LyricsLayoutEngine.FontScale(
-                _displayFontSizes[i], LyricsLayoutEngine.HighlightFontSize);
-            var secondaryScale = LyricsLayoutEngine.FontScale(
-                _displaySecondaryFontSizes[i], LyricsLayoutEngine.SecondaryHighlightFontSize);
-            LyricsLayoutEngine.ScaleFocusedMetrics(
-                _focusedMetrics[i],
-                mainScale,
-                secondaryScale,
-                out _textHeights[i],
-                out _translationHeights[i],
-                out _romanjiHeights[i],
-                out _lineHeights[i],
-                out _,
-                out _,
-                out _);
+            var focused = _focusedMetrics[i];
+            _textHeights[i] = focused.TextHeight;
+            _translationHeights[i] = focused.TranslationHeight;
+            _romanjiHeights[i] = focused.RomanjiHeight;
+            _lineHeights[i] = focused.LineHeight;
         }
 
         float y = 0;
@@ -681,7 +526,7 @@ public sealed class LyricsD2DControl : Grid
 
         for (var i = 0; i < count; i++)
         {
-            _focusedMetrics[i] = MeasureFocusedLine(
+            _focusedMetrics[i] = MeasureLine(
                 vm.Lyrics[i],
                 showTranslation,
                 showRomanji,
@@ -694,24 +539,24 @@ public sealed class LyricsD2DControl : Grid
         _metricsCacheDirty = false;
     }
 
-    private LyricsLayoutEngine.LyricSizeMetrics MeasureFocusedLine(
+    private LyricsLayoutEngine.LyricSizeMetrics MeasureLine(
         LyricLineViewModel line,
         bool showTranslation,
         bool showRomanji,
         float width)
     {
-        if (_surface is null)
+        if (_renderer is null)
             return default;
 
-        var text = _surface.MeasureText(
-            line.Text, LyricsLayoutEngine.HighlightFontSize, true, width);
+        var text = _renderer.MeasureText(
+            line.Text, LyricsLayoutEngine.MainFontSize, true, width);
         var translation = showTranslation && line.HasTranslation
-            ? _surface.MeasureText(
-                line.Translation ?? string.Empty, LyricsLayoutEngine.SecondaryHighlightFontSize, false, width)
+            ? _renderer.MeasureText(
+                line.Translation ?? string.Empty, LyricsLayoutEngine.SecondaryFontSize, false, width)
             : (0f, 0f);
         var romanji = showRomanji && line.HasRomanji
-            ? _surface.MeasureText(
-                line.Romanji ?? string.Empty, LyricsLayoutEngine.SecondaryHighlightFontSize, false, width)
+            ? _renderer.MeasureText(
+                line.Romanji ?? string.Empty, LyricsLayoutEngine.SecondaryFontSize, false, width)
             : (0f, 0f);
         return new LyricsLayoutEngine.LyricSizeMetrics(
             text.Height,
@@ -722,90 +567,86 @@ public sealed class LyricsD2DControl : Grid
             romanji.Item2);
     }
 
-    private void RenderFrame()
+    private void OnSkElementPaintSurface(object? sender, SKPaintSurfaceEventArgs e)
     {
-        if (_surface is null || ActualWidth <= 0 || ActualHeight <= 0)
+        // WPF-initiated repaints (resize etc.) bypass the CompositionTarget.Rendering
+        // tick, so the layout must be validated here as well.
+        EnsureLayout();
+
+        var canvas = e.Surface.Canvas;
+        canvas.Clear(SKColors.Transparent);
+
+        if (_renderer is null || ActualWidth <= 0 || ActualHeight <= 0)
             return;
 
-        if (!_surface.BeginDraw())
+        var vm = _viewModel;
+        if (vm is null)
             return;
 
-        try
+        var offset = (float)VerticalOffset;
+        var viewportHeight = (float)ActualHeight;
+        var width = _layoutWidth;
+        var textX = LyricsLayoutEngine.ContentPaddingLeft;
+        var count = vm.Lyrics.Count;
+        if (_hoverPaintIndex >= 0 && _hoverPaintIndex < count && _hoverAlpha > 0.01f)
         {
-            _surface.ClearTransparent();
-            var vm = _viewModel;
-            if (vm is null)
-                return;
-
-            var offset = (float)VerticalOffset;
-            var viewportHeight = (float)ActualHeight;
-            var width = _layoutWidth;
-            var textX = LyricsLayoutEngine.ContentPaddingLeft;
-            var count = vm.Lyrics.Count;
-            if (_hoverPaintIndex >= 0 && _hoverPaintIndex < count && _hoverAlpha > 0.01f)
-            {
-                var hoverTop = _lineTops[_hoverPaintIndex] - offset;
-                DrawHoverBackground(hoverTop, _lineHeights[_hoverPaintIndex]);
-            }
-
-            for (var i = 0; i < count; i++)
-            {
-                var top = _lineTops[i] - offset;
-                var bottom = top + _lineHeights[i];
-                if (bottom < 0 || top > viewportHeight)
-                    continue;
-
-                var line = vm.Lyrics[i];
-                var highlighted = line.IsHighlighted;
-                var mainScale = LyricsLayoutEngine.FontScale(
-                    _displayFontSizes[i], LyricsLayoutEngine.HighlightFontSize);
-                var secondaryScale = LyricsLayoutEngine.FontScale(
-                    _displaySecondaryFontSizes[i], LyricsLayoutEngine.SecondaryHighlightFontSize);
-                var focused = i < _focusedMetrics.Length ? _focusedMetrics[i] : default;
-                var y = top + LyricsLayoutEngine.ItemPaddingY;
-
-                DrawMainLineText(i, line, highlighted, textX, y, width, focused.TextHeight, mainScale);
-                y += _textHeights[i];
-
-                if (_translationHeights[i] > 0 && line.Translation is not null)
-                {
-                    y += LyricsLayoutEngine.SecondaryLineGap;
-                    DrawLineText(
-                        line.Translation,
-                        LyricsLayoutEngine.SecondaryHighlightFontSize,
-                        false,
-                        textX,
-                        y,
-                        width,
-                        focused.TranslationHeight,
-                        highlighted ? SecondaryHighlight : SecondaryNormal,
-                        secondaryScale);
-                    y += _translationHeights[i];
-                }
-
-                if (_romanjiHeights[i] > 0 && line.Romanji is not null)
-                {
-                    y += LyricsLayoutEngine.SecondaryLineGap;
-                    DrawLineText(
-                        line.Romanji,
-                        LyricsLayoutEngine.SecondaryHighlightFontSize,
-                        false,
-                        textX,
-                        y,
-                        width,
-                        focused.RomanjiHeight,
-                        highlighted ? SecondaryHighlight : SecondaryNormal,
-                        secondaryScale);
-                }
-            }
+            var hoverTop = _lineTops[_hoverPaintIndex] - offset + LineScrollOffset(_hoverPaintIndex);
+            DrawHoverBackground(canvas, hoverTop, _lineHeights[_hoverPaintIndex]);
         }
-        finally
+
+        for (var i = 0; i < count; i++)
         {
-            _surface.EndDraw();
+            var top = _lineTops[i] - offset + LineScrollOffset(i);
+            var bottom = top + _lineHeights[i];
+            if (bottom < 0 || top > viewportHeight)
+                continue;
+
+            var line = vm.Lyrics[i];
+            var highlighted = line.IsHighlighted;
+            var focused = i < _focusedMetrics.Length ? _focusedMetrics[i] : default;
+            var y = top + LyricsLayoutEngine.ItemPaddingY;
+
+            DrawMainLineText(canvas, i, line, highlighted, textX, y, width, focused.TextHeight);
+            y += _textHeights[i];
+
+            if (_translationHeights[i] > 0 && line.Translation is not null)
+            {
+                y += LyricsLayoutEngine.SecondaryLineGap;
+                DrawLineText(
+                    canvas,
+                    line.Translation,
+                    LyricsLayoutEngine.SecondaryFontSize,
+                    false,
+                    textX,
+                    y,
+                    width,
+                    focused.TranslationHeight,
+                    highlighted ? SecondaryHighlight : SecondaryNormal);
+                y += _translationHeights[i];
+            }
+
+            if (_romanjiHeights[i] > 0 && line.Romanji is not null)
+            {
+                y += LyricsLayoutEngine.SecondaryLineGap;
+                DrawLineText(
+                    canvas,
+                    line.Romanji,
+                    LyricsLayoutEngine.SecondaryFontSize,
+                    false,
+                    textX,
+                    y,
+                    width,
+                    focused.RomanjiHeight,
+                    highlighted ? SecondaryHighlight : SecondaryNormal);
+            }
         }
     }
 
+    private float LineScrollOffset(int index) =>
+        index < _lineScrollOffsets.Length ? _lineScrollOffsets[index] : 0f;
+
     private void DrawLineText(
+        SKCanvas canvas,
         string text,
         float fontSize,
         bool bold,
@@ -813,13 +654,13 @@ public sealed class LyricsD2DControl : Grid
         float y,
         float width,
         float height,
-        Color color,
-        float scale)
+        SKColor color)
     {
-        if (_surface is null)
+        if (_renderer is null)
             return;
 
-        _surface.DrawText(
+        _renderer.DrawText(
+            canvas,
             text,
             fontSize,
             bold,
@@ -827,78 +668,69 @@ public sealed class LyricsD2DControl : Grid
             y,
             width,
             height,
-            color.R / 255f,
-            color.G / 255f,
-            color.B / 255f,
-            color.A / 255f,
-            scale);
+            color);
     }
 
     /// <summary>
     /// Draws the primary lyric text. For a highlighted line that carries karaoke progress
     /// this replicates the original karaoke behaviour: the dim base text is painted first,
     /// then the sung portion of every wrapped line is over-painted in the highlight colour,
-    /// clipped per wrapped line to the length reported by DirectWrite hit-testing.
+    /// clipped per wrapped line to the length reported by text caret hit-testing.
     /// </summary>
     private void DrawMainLineText(
+        SKCanvas canvas,
         int index,
         LyricLineViewModel line,
         bool highlighted,
         float x,
         float y,
         float width,
-        float height,
-        float scale)
+        float height)
     {
-        if (_surface is null)
+        if (_renderer is null)
             return;
 
         if (!highlighted || !line.IsProgressEnabled)
         {
             DrawLineText(
+                canvas,
                 line.Text,
-                LyricsLayoutEngine.HighlightFontSize,
+                LyricsLayoutEngine.MainFontSize,
                 true,
                 x,
                 y,
                 width,
                 height,
-                highlighted ? LyricHighlight : LyricNormal,
-                scale);
+                highlighted ? LyricHighlight : LyricNormal);
             return;
         }
 
         var progress = Math.Clamp(line.Progress, 0.0, 1.0);
         var lineWidths = GetKaraokeLineWidths(index, line, width, progress);
 
-        _surface.DrawKaraokeText(
+        _renderer.DrawKaraokeText(
+            canvas,
             line.Text,
-            LyricsLayoutEngine.HighlightFontSize,
+            LyricsLayoutEngine.MainFontSize,
             true,
             x,
             y,
             width,
             height,
-            scale,
-            LyricNormal.R / 255f,
-            LyricNormal.G / 255f,
-            LyricNormal.B / 255f,
-            LyricNormal.A / 255f,
-            LyricHighlight.R / 255f,
-            LyricHighlight.G / 255f,
-            LyricHighlight.B / 255f,
-            LyricHighlight.A / 255f,
+            1f,
+            LyricNormal,
+            LyricHighlight,
             lineWidths);
     }
 
     private float[] GetKaraokeLineWidths(int index, LyricLineViewModel line, float width, double progress)
     {
-        if (_surface is null)
+        if (_renderer is null)
             return [];
 
         // Recompute only when the highlighted line, its text, the layout width, or the
-        // progress changes. This keeps the expensive DirectWrite hit-testing off the
-        // per-frame path unless karaoke progress actually advances.
+        // progress changes. This keeps the expensive text hit-testing off the per-frame
+        // path unless karaoke progress actually advances.
         if (_karaokeLineIndex == index
             && string.Equals(_karaokeText, line.Text, StringComparison.Ordinal)
             && Math.Abs(_karaokeProgress - progress) < 0.0005
@@ -908,9 +740,9 @@ public sealed class LyricsD2DControl : Grid
             return _karaokeLineWidths;
         }
 
-        _karaokeLineWidths = _surface.ComputeKaraokeLineWidths(
+        _karaokeLineWidths = _renderer.ComputeKaraokeLineWidths(
             line.Text,
-            LyricsLayoutEngine.HighlightFontSize,
+            LyricsLayoutEngine.MainFontSize,
             true,
             width,
             progress);
@@ -921,22 +753,20 @@ public sealed class LyricsD2DControl : Grid
         return _karaokeLineWidths;
     }
 
-    private void DrawHoverBackground(float top, float height)
+    private void DrawHoverBackground(SKCanvas canvas, float top, float height)
     {
-        if (_surface is null || height <= 0)
+        if (_renderer is null || height <= 0)
             return;
 
-        var alpha = HoverFill.A / 255f * _hoverAlpha;
-        _surface.FillRoundedRectangle(
+        var color = HoverFill.WithAlpha((byte)Math.Clamp(HoverFill.Alpha * _hoverAlpha, 0f, 255f));
+        _renderer.FillRoundedRectangle(
+            canvas,
             8f,
             top,
             Math.Max(0f, (float)ActualWidth - 16f),
             height,
             8f,
-            HoverFill.R / 255f,
-            HoverFill.G / 255f,
-            HoverFill.B / 255f,
-            alpha);
+            color);
     }
 
     private void UpdateHoverIndex(int index)
@@ -975,36 +805,97 @@ public sealed class LyricsD2DControl : Grid
         return true;
     }
 
+    /// <summary>
+    /// Advances the staggered auto-follow scroll. The global offset is already at its
+    /// target; each line's extra offset eases back to zero with a start delay that grows
+    /// for rows further below the active line. Returns true while any line is moving.
+    /// </summary>
+    private bool TickStagger()
+    {
+        if (!_staggerActive)
+            return false;
+
+        var elapsedMs = (DateTime.UtcNow.Ticks - _staggerStartTicks) / (double)TimeSpan.TicksPerMillisecond;
+        var animating = false;
+        for (var i = 0; i < _lineScrollOffsets.Length; i++)
+        {
+            var delayMs = LyricsLayoutEngine.StaggerDelayMilliseconds(i, _staggerAnchorIndex);
+            var t = (float)((elapsedMs - delayMs) / LyricsLayoutEngine.ScrollAnimationMilliseconds);
+            if (t >= 1f)
+            {
+                _lineScrollOffsets[i] = 0f;
+                continue;
+            }
+
+            animating = true;
+            if (t <= 0f)
+                continue;
+
+            _lineScrollOffsets[i] = _staggerFromOffsets[i] * (1f - LyricsLayoutEngine.EaseInOutCubic(t));
+        }
+
+        if (!animating)
+        {
+            _staggerActive = false;
+            return false;
+        }
+
+        _dirty = true;
+        return true;
+    }
+
     private void SuspendAutoScroll()
     {
         _autoScrollEnabled = false;
         _lastUserScrollUtc = DateTime.UtcNow;
+        CancelStagger();
     }
 
     private int HitTest(double viewY)
     {
         EnsureLayout();
-        return LyricsLayoutEngine.HitTestLine(_lineTops, _lineHeights, viewY + VerticalOffset);
+        // During a stagger the visual position of a line differs from its layout
+        // position, so hit testing accounts for the per-line scroll offsets too.
+        var contentY = viewY + VerticalOffset;
+        for (var i = 0; i < _lineTops.Length; i++)
+        {
+            var top = _lineTops[i] + LineScrollOffset(i);
+            if (contentY >= top && contentY < top + _lineHeights[i])
+                return i;
+        }
+
+        return -1;
     }
 
-    private void AnimateScrollTo(double target)
+    private void StartStaggeredScrollTo(double target, int anchorIndex)
     {
         target = LyricsLayoutEngine.ClampOffset(target, ActualHeight, _contentHeight);
-        BeginAnimation(VerticalOffsetProperty, null);
+        var delta = target - VerticalOffset;
+        VerticalOffset = target;
+        if (Math.Abs(delta) < 0.5)
+            return;
 
-        var animation = new DoubleAnimation
+        // Keep every line at its current visual position, then let TickStagger ease the
+        // offsets back to zero. Accumulating handles a stagger starting mid-flight.
+        for (var i = 0; i < _lineScrollOffsets.Length; i++)
         {
-            From = VerticalOffset,
-            To = target,
-            Duration = new Duration(TimeSpan.FromMilliseconds(LyricsLayoutEngine.ScrollAnimationMilliseconds)),
-            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut }
-        };
-        animation.Completed += (_, _) =>
-        {
-            BeginAnimation(VerticalOffsetProperty, null);
-            VerticalOffset = target;
-        };
-        BeginAnimation(VerticalOffsetProperty, animation);
+            _lineScrollOffsets[i] += (float)delta;
+            _staggerFromOffsets[i] = _lineScrollOffsets[i];
+        }
+
+        _staggerAnchorIndex = anchorIndex;
+        _staggerStartTicks = DateTime.UtcNow.Ticks;
+        _staggerActive = true;
+        _dirty = true;
+    }
+
+    private void CancelStagger()
+    {
+        if (!_staggerActive)
+            return;
+
+        _staggerActive = false;
+        Array.Clear(_lineScrollOffsets, 0, _lineScrollOffsets.Length);
     }
 
     private void UpdateScrollBar()
@@ -1024,7 +915,6 @@ public sealed class LyricsD2DControl : Grid
         if (_updatingScrollBar)
             return;
         SuspendAutoScroll();
-        BeginAnimation(VerticalOffsetProperty, null);
         VerticalOffset = e.NewValue;
     }
 

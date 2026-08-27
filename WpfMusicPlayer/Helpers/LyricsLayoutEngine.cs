@@ -8,29 +8,38 @@ public static class LyricsLayoutEngine
     public const float SecondaryLineGap = 2f;
     public const float ContentPaddingLeft = 16f;
     public const float ContentPaddingRight = 20f;
-    public const float NormalFontSize = 18f;
-    public const float HighlightFontSize = 24f;
-    public const float SecondaryNormalFontSize = 15f;
-    public const float SecondaryHighlightFontSize = 17f;
-    public const double AnimationDurationSeconds = 0.25;
+    public const float SecondaryFontSize = 15f;
+    // Every lyric line is drawn at the same size; the active line stands out through
+    // colour alone. The main text is 1.8x the secondary (translation/romanji) size.
+    public const float MainFontSize = SecondaryFontSize * 1.8f;
     public const double HoverFadeSeconds = 0.18;
-    public const double ScrollAnimationMilliseconds = 250;
+    // Duration of one line's scroll ease, plus the extra start delay added per row
+    // below the active line: lower rows join the upward motion later, so the list
+    // appears to flow from top to bottom.
+    public const double ScrollAnimationMilliseconds = 500;
+    public const double ScrollStaggerPerLineMilliseconds = 60;
+    public const int ScrollStaggerMaxLines = 6;
+    // Fraction of the viewport height where the active line's top edge rests while
+    // auto-following, so upcoming lines stay visible below it.
+    public const double ActiveLineAnchorRatio = 0.2;
     public static readonly TimeSpan AutoFollowIdleThreshold = TimeSpan.FromSeconds(10);
 
     public static bool ShouldResumeAutoFollow(bool followSuspended, TimeSpan idleDuration) =>
         followSuspended && idleDuration >= AutoFollowIdleThreshold;
 
-    public static float EaseOutCubic(float t)
+    public static float EaseInOutCubic(float t)
     {
         t = Math.Clamp(t, 0f, 1f);
-        var inv = 1f - t;
-        return 1f - inv * inv * inv;
+        return t < 0.5f
+            ? 4f * t * t * t
+            : 1f - MathF.Pow(-2f * t + 2f, 3f) / 2f;
     }
 
-    public static float Lerp(float a, float b, float t) => a + (b - a) * t;
-
-    public static float AnimateToward(float from, float to, float linearT) =>
-        Lerp(from, to, EaseOutCubic(linearT));
+    public static double StaggerDelayMilliseconds(int lineIndex, int anchorIndex)
+    {
+        var rowsBelow = Math.Clamp(lineIndex - anchorIndex, 0, ScrollStaggerMaxLines);
+        return rowsBelow * ScrollStaggerPerLineMilliseconds;
+    }
 
     public readonly struct LyricSizeMetrics
     {
@@ -73,35 +82,6 @@ public static class LyricsLayoutEngine
         return height;
     }
 
-    public static float FontScale(float currentSize, float focusedSize) =>
-        focusedSize <= 0.01f ? 1f : Math.Clamp(currentSize / focusedSize, 0.01f, 1f);
-
-    public static void ScaleFocusedMetrics(
-        in LyricSizeMetrics focused,
-        float mainScale,
-        float secondaryScale,
-        out float textHeight,
-        out float translationHeight,
-        out float romanjiHeight,
-        out float lineHeight,
-        out float textWidth,
-        out float translationWidth,
-        out float romanjiWidth)
-    {
-        mainScale = Math.Clamp(mainScale, 0.01f, 1f);
-        secondaryScale = Math.Clamp(secondaryScale, 0.01f, 1f);
-        textHeight = focused.TextHeight * mainScale;
-        translationHeight = focused.TranslationHeight * secondaryScale;
-        romanjiHeight = focused.RomanjiHeight * secondaryScale;
-        textWidth = focused.TextWidth * mainScale;
-        translationWidth = focused.TranslationWidth * secondaryScale;
-        romanjiWidth = focused.RomanjiWidth * secondaryScale;
-        lineHeight = MeasureLineHeight(
-            textHeight,
-            translationHeight > 0f ? translationHeight : null,
-            romanjiHeight > 0f ? romanjiHeight : null);
-    }
-
     public static double ComputeContentHeight(IReadOnlyList<float> lineHeights)
     {
         double total = 0;
@@ -110,13 +90,12 @@ public static class LyricsLayoutEngine
         return total;
     }
 
-    public static double ComputeCenterOffset(
+    public static double ComputeAnchorOffset(
         double itemTop,
-        double itemHeight,
         double viewportHeight,
         double contentHeight)
     {
-        var target = itemTop + itemHeight / 2d - viewportHeight / 2d;
+        var target = itemTop - viewportHeight * ActiveLineAnchorRatio;
         var max = Math.Max(0d, contentHeight - viewportHeight);
         return Math.Clamp(target, 0d, max);
     }

@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -33,9 +33,9 @@
     <PackageReference Include="Serilog.Settings.Configuration" Version="10.0.1-dev-02330" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
     <PackageReference Include="Serilog.Sinks.File" Version="8.0.0-nblumhardt-02322" />
-    <PackageReference Include="Silk.NET.Direct2D" Version="2.23.0" />
-    <PackageReference Include="Silk.NET.DXGI" Version="2.23.0" />
     <PackageReference Include="SkiaSharp" Version="4.148.0" />
+    <PackageReference Include="SkiaSharp.Views.WPF" Version="4.148.0" />
+    <PackageReference Include="Topten.RichTextKit" Version="0.4.167" />
   </ItemGroup>
 
   <ItemGroup>

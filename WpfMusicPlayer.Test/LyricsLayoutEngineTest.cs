@@ -8,22 +8,38 @@ namespace WpfMusicPlayer.Test;
 public sealed class LyricsLayoutEngineTest
 {
     [TestMethod]
-    public void EaseOutCubic_StartsAndEndsAtExpectedValues()
+    public void MainFontSize_IsOnePointEightTimesSecondaryFontSize()
     {
-        Assert.AreEqual(0f, LyricsLayoutEngine.EaseOutCubic(0f), 0.0001f);
-        Assert.AreEqual(1f, LyricsLayoutEngine.EaseOutCubic(1f), 0.0001f);
-        Assert.IsGreaterThan(0.5f, LyricsLayoutEngine.EaseOutCubic(0.5f));
+        Assert.AreEqual(LyricsLayoutEngine.SecondaryFontSize * 1.8f, LyricsLayoutEngine.MainFontSize, 0.0001f);
     }
 
     [TestMethod]
-    public void AnimateToward_InterpolatesFontSizeWithEaseOut()
+    public void EaseInOutCubic_StartsAndEndsAtExpectedValues()
     {
-        var mid = LyricsLayoutEngine.AnimateToward(
-            LyricsLayoutEngine.NormalFontSize,
-            LyricsLayoutEngine.HighlightFontSize,
-            0.5f);
-        Assert.IsGreaterThan(21f, mid);
-        Assert.IsLessThan(24f, mid);
+        Assert.AreEqual(0f, LyricsLayoutEngine.EaseInOutCubic(0f), 0.0001f);
+        Assert.AreEqual(0.5f, LyricsLayoutEngine.EaseInOutCubic(0.5f), 0.0001f);
+        Assert.AreEqual(1f, LyricsLayoutEngine.EaseInOutCubic(1f), 0.0001f);
+    }
+
+    [TestMethod]
+    public void StaggerDelayMilliseconds_OnlyRowsBelowAnchorAreDelayed()
+    {
+        Assert.AreEqual(0d, LyricsLayoutEngine.StaggerDelayMilliseconds(2, 5), 0.0001);
+        Assert.AreEqual(0d, LyricsLayoutEngine.StaggerDelayMilliseconds(5, 5), 0.0001);
+        Assert.AreEqual(
+            2 * LyricsLayoutEngine.ScrollStaggerPerLineMilliseconds,
+            LyricsLayoutEngine.StaggerDelayMilliseconds(7, 5),
+            0.0001);
+    }
+
+    [TestMethod]
+    public void StaggerDelayMilliseconds_CapsDelayAtMaxLines()
+    {
+        var capped = LyricsLayoutEngine.StaggerDelayMilliseconds(100, 0);
+        Assert.AreEqual(
+            LyricsLayoutEngine.ScrollStaggerMaxLines * LyricsLayoutEngine.ScrollStaggerPerLineMilliseconds,
+            capped,
+            0.0001);
     }
 
     [TestMethod]
@@ -40,17 +56,24 @@ public sealed class LyricsLayoutEngineTest
     }
 
     [TestMethod]
-    public void ComputeCenterOffset_CentersItemInsideViewport()
+    public void ComputeAnchorOffset_PlacesItemTopAtAnchorRatio()
     {
-        var offset = LyricsLayoutEngine.ComputeCenterOffset(itemTop: 400, itemHeight: 40, viewportHeight: 200, contentHeight: 1000);
-        Assert.AreEqual(320d, offset, 0.001);
+        var offset = LyricsLayoutEngine.ComputeAnchorOffset(itemTop: 400, viewportHeight: 200, contentHeight: 1000);
+        Assert.AreEqual(400d - 200d * LyricsLayoutEngine.ActiveLineAnchorRatio, offset, 0.001);
     }
 
     [TestMethod]
-    public void ComputeCenterOffset_ClampsWhenContentIsShorterThanViewport()
+    public void ComputeAnchorOffset_ClampsToZeroNearContentStart()
     {
-        var offset = LyricsLayoutEngine.ComputeCenterOffset(itemTop: 10, itemHeight: 20, viewportHeight: 400, contentHeight: 80);
+        var offset = LyricsLayoutEngine.ComputeAnchorOffset(itemTop: 10, viewportHeight: 400, contentHeight: 1000);
         Assert.AreEqual(0d, offset, 0.001);
+    }
+
+    [TestMethod]
+    public void ComputeAnchorOffset_ClampsToScrollableRangeNearContentEnd()
+    {
+        var offset = LyricsLayoutEngine.ComputeAnchorOffset(itemTop: 990, viewportHeight: 200, contentHeight: 1000);
+        Assert.AreEqual(800d, offset, 0.001);
     }
 
     [TestMethod]
@@ -85,45 +108,6 @@ public sealed class LyricsLayoutEngineTest
     {
         var metrics = new LyricsLayoutEngine.LyricSizeMetrics(20f, 14f, 12f);
         Assert.AreEqual(76f, metrics.LineHeight, 0.001f);
-    }
-
-    [TestMethod]
-    public void ScaleFocusedMetrics_DerivesShrunkWidthFromFocusedLayout()
-    {
-        var focused = new LyricsLayoutEngine.LyricSizeMetrics(
-            textHeight: 40f,
-            translationHeight: 20f,
-            romanjiHeight: 20f,
-            textWidth: 200f,
-            translationWidth: 160f,
-            romanjiWidth: 140f);
-
-        var mainScale = LyricsLayoutEngine.FontScale(18f, 24f);
-        var secondaryScale = LyricsLayoutEngine.FontScale(15f, 17f);
-        Assert.AreEqual(0.75f, mainScale, 0.0001f);
-
-        LyricsLayoutEngine.ScaleFocusedMetrics(
-            focused,
-            mainScale,
-            secondaryScale,
-            out var textHeight,
-            out var translationHeight,
-            out var romanjiHeight,
-            out var lineHeight,
-            out var textWidth,
-            out var translationWidth,
-            out var romanjiWidth);
-
-        Assert.AreEqual(30f, textHeight, 0.001f);
-        Assert.AreEqual(150f, textWidth, 0.001f);
-        Assert.AreEqual(20f * secondaryScale, translationHeight, 0.001f);
-        Assert.AreEqual(160f * secondaryScale, translationWidth, 0.001f);
-        Assert.AreEqual(20f * secondaryScale, romanjiHeight, 0.001f);
-        Assert.AreEqual(140f * secondaryScale, romanjiWidth, 0.001f);
-        Assert.AreEqual(
-            LyricsLayoutEngine.MeasureLineHeight(textHeight, translationHeight, romanjiHeight),
-            lineHeight,
-            0.001f);
     }
 
     [TestMethod]

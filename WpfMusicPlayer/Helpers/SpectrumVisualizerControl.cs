@@ -2,10 +2,13 @@
 
 using System.Windows;
 using System.Windows.Media;
+using SkiaSharp;
+using SkiaSharp.Views.Desktop;
+using SkiaSharp.Views.WPF;
 
 namespace WpfMusicPlayer.Helpers;
 
-public class SpectrumVisualizerControl : FrameworkElement
+public class SpectrumVisualizerControl : SKElement
 {
     private const float SmoothRise = 20.0f;
     private const float SmoothFall = 4.5f;
@@ -89,6 +92,9 @@ public class SpectrumVisualizerControl : FrameworkElement
 
     public SpectrumVisualizerControl()
     {
+        // Same SKElement setup as the lyric renderer: DIP-space drawing on a
+        // full-resolution backing bitmap.
+        IgnorePixelScaling = true;
         Loaded += (_, _) => StartRendering();
         Unloaded += (_, _) => StopRendering();
     }
@@ -183,9 +189,12 @@ public class SpectrumVisualizerControl : FrameworkElement
             InvalidateVisual();
     }
 
-    protected override void OnRender(DrawingContext dc)
+    protected override void OnPaintSurface(SKPaintSurfaceEventArgs e)
     {
-        base.OnRender(dc);
+        base.OnPaintSurface(e);
+
+        var canvas = e.Surface.Canvas;
+        canvas.Clear(SKColors.Transparent);
 
         double w = ActualWidth, h = ActualHeight;
         if (w <= 0 || h <= 0 || _segmentCount == 0) return;
@@ -193,29 +202,53 @@ public class SpectrumVisualizerControl : FrameworkElement
         double spacing = BarSpacing;
         double barW = (w - spacing * (_segmentCount - 1)) / _segmentCount;
         if (barW < 1) barW = 1;
-        double cr = BarCornerRadius;
+        float cr = (float)BarCornerRadius;
 
+        using var paint = new SKPaint
+        {
+            Style = SKPaintStyle.Fill,
+            IsAntialias = true
+        };
 
         // main bars
-        var brush = BarBrush;
+        paint.Color = ToSKColor(BarBrush, SKColors.White);
         for (int i = 0; i < _segmentCount; i++)
         {
             double bh = _displayValues[i] * h;
             if (bh < 0.5) continue;
             double x = i * (barW + spacing);
             double y = h - bh;
-            dc.DrawRoundedRectangle(brush, null, new Rect(x, y, barW, bh), cr, cr);
+            canvas.DrawRoundRect(
+                new SKRect((float)x, (float)y, (float)(x + barW), (float)h),
+                cr,
+                cr,
+                paint);
         }
 
         // peak indicators
-        var peakBrush = PeakBrush;
+        paint.Color = ToSKColor(PeakBrush, new SKColor(255, 255, 255, 180));
         for (int i = 0; i < _segmentCount; i++)
         {
             if (_peakValues[i] < 0.01f) continue;
             double py = h - _peakValues[i] * h;
             double x = i * (barW + spacing);
-            dc.DrawRoundedRectangle(peakBrush, null,
-                new Rect(x, py, barW, 2), 1, 1);
+            canvas.DrawRoundRect(
+                new SKRect((float)x, (float)py, (float)(x + barW), (float)(py + 2)),
+                1,
+                1,
+                paint);
         }
+    }
+
+    private static SKColor ToSKColor(Brush brush, SKColor fallback)
+    {
+        if (brush is SolidColorBrush solid)
+        {
+            var c = solid.Color;
+            var a = (byte)Math.Clamp(c.A * solid.Opacity, 0.0, 255.0);
+            return new SKColor(c.R, c.G, c.B, a);
+        }
+
+        return fallback;
     }
 }
